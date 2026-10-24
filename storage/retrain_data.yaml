@@ -1,0 +1,7 @@
+names:
+- gun
+path: C:\self data\advance ai\gun-detection
+train:
+- dataset/train/images
+- storage/new_data/images
+val: dataset/valid/images

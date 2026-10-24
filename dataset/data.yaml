@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['gun']
+
+roboflow:
+  workspace: sohails-workspace-zp5ae
+  project: gun-ogblr-mtlo3
+  version: 1
+  license: Public Domain
+  url: https://app.roboflow.com/sohails-workspace-zp5ae/gun-ogblr-mtlo3/1
