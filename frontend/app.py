@@ -1,7 +1,17 @@
 import io
+import math
+import struct
+import tempfile
+import time
+import wave
+from functools import lru_cache
+from pathlib import Path
+
+import cv2
 import requests
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps
+from ultralytics import YOLO
 
 API_URL = "http://127.0.0.1:8000"
 
@@ -48,7 +58,9 @@ section[data-testid="stSidebar"]{ background:var(--surface); border-right:1px so
 .banner{ border-radius:8px; padding:14px 18px; margin:14px 0; border:1px solid; }
 .banner b{ font-size:1.05rem; }
 .banner span{ display:block; font-size:.85rem; margin-top:2px; }
-.banner.alert{ background:#FBECEA; border-color:#F0BDB8; color:#8E2119; }
+.banner.alert{ background:#C8352B; border-color:#9E1F17; color:#fff; animation:pulse 0.9s infinite; }
+@keyframes pulse{ 0%,100%{ box-shadow:0 0 0 0 rgba(200,53,43,.55); } 50%{ box-shadow:0 0 0 14px rgba(200,53,43,0); } }
+[data-testid="stAudio"], [data-testid="stAudioInput"]{ height:0; overflow:hidden; opacity:0; margin:0; }
 .banner.clear{ background:#E8F4EE; border-color:#B7DDC9; color:#1F5C41; }
 
 /* metrics */
@@ -81,8 +93,8 @@ def backend_online() -> bool:
 def banner(count: int):
     if count:
         st.markdown(
-            f'<div class="banner alert"><b>{count} object detected</b>'
-            f"<span>Result image mein boxes check karo.</span></div>",
+            f'<div class="banner alert"><b>ALERT: {count} object detected</b>'
+            f"<span>Hathiyar ki detection hui hai. Boxes check karo.</span></div>",
             unsafe_allow_html=True,
         )
     else:
@@ -91,6 +103,37 @@ def banner(count: int):
             "<span>Confidence slider kam karke dobara try kar sakte ho.</span></div>",
             unsafe_allow_html=True,
         )
+
+
+
+@lru_cache(maxsize=64)
+def make_alarm(n: int = 0) -> bytes:
+    """Do-tone siren (WAV). n sirf bytes thori alag karta hai taake browser dobara play kare."""
+    rate = 22050
+    frames = bytearray()
+    for i in range(int(rate * 1.2)):
+        t = i / rate
+        freq = 950 if int(t * 4) % 2 == 0 else 700
+        v = int(32767 * 0.6 * math.sin(2 * math.pi * freq * t))
+        frames += struct.pack("<h", v)
+    frames += b"\x00\x00" * (n % 50 + 1)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
+def play_alarm(target=None, n: int = 0):
+    if not st.session_state.get("alarm_on", True):
+        return
+    (target if target is not None else st).audio(make_alarm(n), format="audio/wav", autoplay=True)
+
+
+def red_border(img: Image.Image, width: int = 14) -> Image.Image:
+    return ImageOps.expand(img.convert("RGB"), border=width, fill=(200, 53, 43))
 
 
 online = backend_online()
@@ -124,6 +167,9 @@ with st.sidebar:
         "Zyada confidence par sirf pakki detections aati hain.</p>",
         unsafe_allow_html=True,
     )
+    st.checkbox("Alarm sound", value=True, key="alarm_on")
+    if st.button("Alarm test karo"):
+        play_alarm(n=1)
     st.divider()
     st.markdown(f'<p class="hint">API: {API_URL}</p>', unsafe_allow_html=True)
 
@@ -131,7 +177,7 @@ if not online:
     st.error("Backend se connect nahi hua. Terminal mein `uvicorn main:app --port 8000` chalao.")
     st.stop()
 
-tab_img, tab_vid, tab_train = st.tabs(["Image", "Video", "Training"])
+tab_img, tab_vid, tab_live, tab_train = st.tabs(["Image", "Video", "Live", "Training"])
 
 # ------------------------------------------------------------------ IMAGE
 with tab_img:
@@ -155,8 +201,11 @@ with tab_img:
                     json_res = requests.post(f"{API_URL}/predict", files=files,
                                              params={"conf": conf}, timeout=120)
                 if img_res.status_code == 200 and json_res.status_code == 200:
-                    st.image(img_res.content)
                     res = json_res.json()
+                    out_img = Image.open(io.BytesIO(img_res.content))
+                    if res["count"]:
+                        out_img = red_border(out_img)
+                    st.image(out_img)
                 else:
                     st.error(f"API error: {img_res.text}")
                     res = None
@@ -166,6 +215,8 @@ with tab_img:
 
         if res is not None:
             banner(res["count"])
+            if res["count"]:
+                play_alarm()
             m1, m2, m3 = st.columns(3)
             confs = [d["confidence"] for d in res["detections"]]
             m1.metric("Objects", res["count"])
@@ -234,6 +285,9 @@ with tab_vid:
             vr = st.session_state["vid_result"]
             pct = (vr["hit"] / vr["total"]) if vr["total"] else 0
             banner(1 if vr["hit"] else 0)
+            if vr["hit"] and not vr.get("alarmed"):
+                play_alarm()
+                vr["alarmed"] = True
             m1, m2, m3 = st.columns(3)
             m1.metric("Total frames", vr["total"])
             m2.metric("Frames with detection", vr["hit"])
@@ -274,3 +328,63 @@ with tab_train:
             st.markdown('<p class="panel-title" style="margin-top:18px">Training log</p>',
                         unsafe_allow_html=True)
             st.code(status["log"], language="text")
+
+# ------------------------------------------------------------------ LIVE
+# Ye block file ke aakhir mein hona zaroori hai, taake loop chalte waqt
+# Training tab ka code block na ho.
+LIVE_MODEL_PATH = Path(__file__).resolve().parent.parent / "backend" / "best.pt"
+
+
+@st.cache_resource
+def get_live_model():
+    return YOLO(str(LIVE_MODEL_PATH))
+
+
+with tab_live:
+    st.markdown(
+        '<p class="hint">Video frame by frame chalegi aur detection saath saath dikhegi. '
+        "Rokne ke liye checkbox untick karo.</p>",
+        unsafe_allow_html=True,
+    )
+    live_vid = st.file_uploader("Video upload karo", type=["mp4", "mov", "avi", "mkv"], key="live")
+    skip = st.slider("Frame skip (zyada = tez, lekin kam smooth)", 1, 5, 2)
+    run = st.checkbox("Start live detection")
+
+    if live_vid is not None and run:
+        live_model = get_live_model()
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        tmp.write(live_vid.getvalue())
+        tmp.close()
+        cap = cv2.VideoCapture(tmp.name)
+
+        alert_box = st.empty()
+        frame_box = st.empty()
+        info_box = st.empty()
+        audio_box = st.empty()
+        last_alarm, beeps = 0.0, 0
+        i = 0
+        while cap.isOpened():
+            ok, frame = cap.read()
+            if not ok:
+                st.info("Video khatam")
+                break
+            i += 1
+            if i % skip:
+                continue
+            frame = cv2.resize(frame, (640, int(frame.shape[0] * 640 / frame.shape[1])))
+            res = live_model.predict(frame, conf=conf, verbose=False)[0]
+            shown = Image.fromarray(res.plot()[..., ::-1])   # BGR -> RGB
+            if len(res.boxes):
+                shown = red_border(shown)
+                alert_box.markdown(
+                    f'<div class="banner alert"><b>ALERT: {len(res.boxes)} object detected</b></div>',
+                    unsafe_allow_html=True)
+                if time.time() - last_alarm > 2.0:      # har 2 second mein ek baar alarm
+                    beeps += 1
+                    play_alarm(audio_box, beeps)
+                    last_alarm = time.time()
+            else:
+                alert_box.empty()
+            frame_box.image(shown)
+            info_box.markdown(f"**Objects in frame:** {len(res.boxes)}")
+        cap.release()

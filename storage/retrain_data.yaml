@@ -1,6 +1,6 @@
 names:
 - gun
-path: C:\self data\advance ai\gun-detection
+path: C:\self data\advance ai\gun_detection
 train:
 - dataset/train/images
 - storage/new_data/images
